@@ -25,6 +25,11 @@ from pyannote.audio.pipelines.utils.hook import ProgressHook
 from tqdm import tqdm
 from werkzeug.utils import secure_filename
 
+from aTrain_core.backends.common import (
+    SRT_MAX_DURATION,
+    group_word_segments,
+    words_to_segments,
+)
 from aTrain_core.globals import SAMPLING_RATE, TIMESTAMP_FORMAT
 from aTrain_core.load_resources import get_model, load_model_config_file
 from aTrain_core.outputs import (
@@ -34,7 +39,7 @@ from aTrain_core.outputs import (
     create_file_id,
     create_metadata,
     create_output_files,
-    named_tuple_to_dict,
+    smooth_speaker_flips,
     transform_speakers_results,
     write_logfile,
 )
@@ -73,12 +78,13 @@ def prepare_transcription(file: Path) -> tuple[Path, str, str]:
 def transcribe(settings: Settings):
     """Transcribes audio file with specified parameters."""
 
+    backend = load_model_config_file()[settings.model]["backend"]
     write_logfile("Directory created", settings.file_id)
     audio_array, audio_duration = load_audio(settings)
     create_metadata(settings, audio_duration)
     model_path = get_model(settings.model)
     write_logfile("Model loaded", settings.file_id)
-    if settings.device == Device.GPU:
+    if settings.device == Device.GPU or backend == "crisper-transformers":
         write_logfile("Transcribing in seperate process", settings.file_id)
         transcript = run_transcription_in_process(settings, model_path, audio_array)
     elif settings.device == Device.CPU:
@@ -86,8 +92,16 @@ def transcribe(settings: Settings):
         transcript = run_transcription(settings, model_path, audio_array)
     if settings.speaker_detection and transcript:
         transcript = run_speaker_detection(settings, audio_duration, audio_array, transcript)
-    create_output_files(transcript, settings.speaker_detection, settings.file_id)
-    write_logfile("No speaker detection. Created output files", settings.file_id)
+    subtitles = transcript
+    if transcript:
+        join_raw = backend != "crisper-transformers"
+        segments = transcript["segments"]
+        transcript = {"segments": group_word_segments(segments, join_raw)}
+        subtitles = {
+            "segments": group_word_segments(segments, join_raw, max_duration=SRT_MAX_DURATION)
+        }
+    create_output_files(transcript, settings.speaker_detection, settings.file_id, subtitles)
+    write_logfile("Created output files", settings.file_id)
     add_processing_time_to_metadata(settings.file_id)
     write_logfile("Processing time added to metadata", settings.file_id)
 
@@ -116,15 +130,32 @@ def run_transcription(
     audio_array: np.ndarray,
     returnDict: DictProxy | dict = {},
 ) -> dict | None:
-    """Run a transcription using a whisper model."""
+    """Run a transcription through the backend selected by the model config."""
+    backend = None
     try:
+        model_info = load_model_config_file()[settings.model]
+        backend = model_info["backend"]
+        if backend == "crisper-transformers":
+            from aTrain_core.backends.crisper_transformers import transcribe as transcribe_crisper
+
+            write_logfile("Transcribing with CrisperWhisper in verbatim mode.", settings.file_id)
+            transcript = transcribe_crisper(settings, model_path, audio_array)
+            write_logfile("Transcription successful", settings.file_id)
+            if settings.device == Device.CPU:
+                returnDict["transcript"] = transcript
+                return transcript
+            returnDict["transcript"] = transcript
+            os._exit(0)
+        if backend != "faster-whisper":
+            raise ValueError(f"Unsupported transcription backend: {backend}")
+
         whisper_model = WhisperModel(
             model_size_or_path=model_path.as_posix(),
             device="cuda" if settings.device == Device.GPU else "cpu",
             compute_type=settings.compute_type.value,
             cpu_threads=settings.cpu_threads,
         )
-        model_type = load_model_config_file()[settings.model]["type"]
+        model_type = model_info["type"]
         write_logfile(f"Transcribing with {model_type} model.", settings.file_id)
 
         segments, info = whisper_model.transcribe(
@@ -133,7 +164,6 @@ def run_transcription(
             beam_size=5,
             word_timestamps=True,
             language=None if settings.language == "auto-detect" else settings.language,
-            max_new_tokens=None if model_type == "distil" else 128,
             no_speech_threshold=0.6,
             condition_on_previous_text=False if model_type == "distil" else True,
             initial_prompt=settings.initial_prompt,
@@ -142,7 +172,17 @@ def run_transcription(
             else settings.temperature,
         )
         segments = transcription_with_progress_bar(segments, info, settings.progress)
-        transcript = {"segments": [named_tuple_to_dict(s) for s in segments]}
+        words = []
+        for segment in segments:
+            if segment.words:
+                words.extend(segment.words)
+            elif segment.text.strip():
+                write_logfile(
+                    f"Segment without word timestamps kept as one word: {segment.start:.1f}s",
+                    settings.file_id,
+                )
+                words.append({"word": segment.text, "start": segment.start, "end": segment.end})
+        transcript = {"segments": words_to_segments(words)}
         write_logfile("Transcription successful", settings.file_id)
         if settings.device == Device.CPU:
             return transcript
@@ -151,10 +191,9 @@ def run_transcription(
             os._exit(0)
 
     except Exception as error:
-        if settings.device == Device.CPU:
+        if settings.device == Device.CPU and backend != "crisper-transformers":
             raise error
-        if settings.device == Device.GPU:
-            returnDict["error"] = error
+        returnDict["error"] = error
 
 
 def transcription_with_progress_bar(segments, info, progress: DictProxy | dict):
@@ -240,5 +279,6 @@ def run_speaker_detection(
     speaker_results = transform_speakers_results(segments)
     write_logfile("Transformed diarization segments", settings.file_id)
     transcript_with_speaker = assign_word_speakers(speaker_results, transcript)
+    smooth_speaker_flips(transcript_with_speaker["segments"])
     write_logfile("Assigned speakers to words", settings.file_id)
     return transcript_with_speaker
